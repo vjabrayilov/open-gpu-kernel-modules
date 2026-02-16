@@ -271,11 +271,21 @@ void tempo_idle_check(struct tempo_gpu_state *g)
 
 void tempo_idle_init(struct tempo_gpu_state *g)
 {
+    pr_info(TEMPO_DRIVER_NAME ": entered tempo_idle_init\n");
     int i;
+    unsigned long flags;
 
     /* Ensure all VMs start with idle timer cleared */
-    for (i = 0; i < TEMPO_MAX_VMS; i++)
-        g->vms[i]->idle_start = ns_to_ktime(0);
+    spin_lock_irqsave(&g->sched_lock, flags);
+    for (i = 0; i < TEMPO_MAX_VMS; i++){
+        struct tempo_vm *vm = g->vms[i];
+        if (!vm)
+            continue;
+        vm->idle_start = ktime_set(0,0);
+        vm->last_yielded = ktime_set(0,0);
+        vm->total_idle_yields = 0;
+    }
+    spin_unlock_irqrestore(&g->sched_lock, flags);
 
     pr_info(TEMPO_DRIVER_NAME ": idle detector initialized "
             "(yield timeout %d μs)\n",
