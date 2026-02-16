@@ -1,0 +1,1 @@
+savedcmd_tempo-gpu.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-6.14.0-1018-aws/scripts/module.lds -o tempo-gpu.ko tempo-gpu.o tempo-gpu.mod.o .module-common.o

@@ -1,0 +1,1 @@
+savedcmd_tempo-gpu.mod := printf '%s\n'   tempo_mdev.o tempo_scheduler.o tempo_runlist.o tempo_tsg.o tempo_vram.o tempo_idle.o tempo_debugfs.o tempo_mmio.o | awk '!x[$$0]++ { print("./"$$0) }' > tempo-gpu.mod

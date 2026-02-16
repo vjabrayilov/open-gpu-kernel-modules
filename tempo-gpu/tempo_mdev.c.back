@@ -1,0 +1,593 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Tempo GPU: VFIO Mediated Device Driver
+ *
+ * Module entry point, PCI setup, mdev lifecycle (create/remove),
+ * and VFIO device operations (ioctl/read/write).
+ */
+
+#include "tempo_gpu.h"
+#include <linux/iommu.h>
+#include <linux/mdev.h>
+#include <linux/sysfs.h>
+
+// /* 1. Update the 'show' signatures to use struct device* and struct device_attribute* */
+// static ssize_t name_show(struct device *dev, struct device_attribute *attr, char *buf)
+// {
+//     return sysfs_emit(buf, "Tempo GPU Full Share (temporal)\n");
+// }
+// /* 2. Use DEVICE_ATTR_RO instead of MDEV_TYPE_ATTR_RO */
+// static DEVICE_ATTR_RO(name);
+//
+// static ssize_t description_show(struct device *dev, struct device_attribute *attr, char *buf)
+// {
+//     return sysfs_emit(buf, "Full GPU access via temporal sharing. "
+//                           "Each VM gets exclusive GPU during its time slice.\n");
+// }
+// static DEVICE_ATTR_RO(description);
+//
+// static ssize_t device_api_show(struct device *dev, struct device_attribute *attr, char *buf)
+// {
+//     return sysfs_emit(buf, "%s\n", VFIO_DEVICE_API_PCI_STRING);
+// }
+// static DEVICE_ATTR_RO(device_api);
+//
+// static ssize_t available_instances_show(struct device *dev,
+//                                         struct device_attribute *attr, char *buf)
+// {
+//     int avail = TEMPO_MAX_VMS;
+//     if (g_tempo)
+//         avail = TEMPO_MAX_VMS - g_tempo->num_vms;
+//     return sysfs_emit(buf, "%d\n", avail);
+// }
+// static DEVICE_ATTR_RO(available_instances);
+
+// /* 3. Update the attribute pointer names (DEVICE_ATTR creates 'dev_attr_...') */
+// static struct attribute *tempo_mdev_type_attrs[] = {
+//     &dev_attr_name.attr,
+//     &dev_attr_description.attr,
+//     &dev_attr_device_api.attr,
+//     &dev_attr_available_instances.attr,
+//     NULL,
+// };
+
+// static struct attribute_group tempo_mdev_type_group = {
+//     .name  = "tempo-1g",
+//     .attrs = tempo_mdev_type_attrs,
+// };
+//
+// static struct attribute_group *tempo_mdev_type_groups[] = {
+//     &tempo_mdev_type_group,
+//     NULL,
+// };
+/* Define the mdev type using your existing attribute group */
+static struct mdev_type tempo_mdev_type = {
+    .sysfs_name = "tempo-1g",  /* This is what appears in /sys/.../mdev_supported_types/ */
+};
+
+/* Create an array of pointers to mdev_types */
+static struct mdev_type *tempo_mdev_types[] = {
+    &tempo_mdev_type,
+};
+// static MDEV_TYPE_ATTR_RO(name);
+//
+// static ssize_t description_show(struct kobject *kobj, struct device *dev, char *buf)
+// {
+//     return sysfs_emit(buf, "Full GPU access via temporal sharing. "
+//                       "Each VM gets exclusive GPU during its time slice.\n");
+// }
+// static MDEV_TYPE_ATTR_RO(description);
+//
+// static ssize_t device_api_show(struct kobject *kobj, struct device *dev, char *buf)
+// {
+//     return sysfs_emit(buf, "%s\n", VFIO_DEVICE_API_PCI_STRING);
+// }
+// static MDEV_TYPE_ATTR_RO(device_api);
+//
+// static ssize_t available_instances_show(struct kobject *kobj,
+//                                         struct device *dev, char *buf)
+// {
+//     int avail = TEMPO_MAX_VMS;
+//     if (g_tempo)
+//         avail = TEMPO_MAX_VMS - g_tempo->num_vms;
+//     return sysfs_emit(buf, "%d\n", avail);
+// }
+// static MDEV_TYPE_ATTR_RO(available_instances);
+//
+// static struct attribute *tempo_mdev_type_attrs[] = {
+//     &mdev_type_attr_name.attr,
+//     &mdev_type_attr_description.attr,
+//     &mdev_type_attr_device_api.attr,
+//     &mdev_type_attr_available_instances.attr,
+//     NULL,
+// };
+//
+// static struct attribute_group tempo_mdev_type_group = {
+//     .name  = "tempo-1g",
+//     .attrs = tempo_mdev_type_attrs,
+// };
+//
+// static struct attribute_group *tempo_mdev_type_groups[] = {
+//     &tempo_mdev_type_group,
+//     NULL,
+// };
+//
+/* ──────────────────────────────────────────────────────────────────
+ * VFIO Device Operations
+ *
+ * The VM communicates with its virtual GPU through these callbacks.
+ * QEMU opens the mdev device and issues ioctl/read/write for:
+ *   - Device capability discovery (GET_INFO, GET_REGION_INFO)
+ *   - MMIO register access (read/write)
+ *   - Interrupt configuration (SET_IRQS)
+ * ────────────────────────────────────────────────────────────────── */
+
+static int tempo_vfio_open_device(struct vfio_device *vdev)
+{
+    struct tempo_vm *vm = container_of(vdev, struct tempo_vm, vfio_dev);
+
+    pr_info(TEMPO_DRIVER_NAME ": VM %d opened by QEMU (uuid %pUb)\n",
+            vm->vm_id, &vm->uuid);
+    return 0;
+}
+
+static void tempo_vfio_close_device(struct vfio_device *vdev)
+{
+    struct tempo_vm *vm = container_of(vdev, struct tempo_vm, vfio_dev);
+
+    /* Deschedule this VM if it's currently running */
+    if (g_tempo->active_vm_id == vm->vm_id) {
+        unsigned long flags;
+
+        spin_lock_irqsave(&g_tempo->sched_lock, flags);
+        vm->state = VM_STATE_IDLE;
+        g_tempo->active_vm_id = -1;
+        spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+
+        tempo_runlist_build_and_submit_empty(g_tempo);
+    }
+
+    pr_info(TEMPO_DRIVER_NAME ": VM %d closed\n", vm->vm_id);
+}
+
+static long tempo_vfio_ioctl(struct vfio_device *vdev, unsigned int cmd,
+                             unsigned long arg)
+{
+    struct tempo_vm *vm = container_of(vdev, struct tempo_vm, vfio_dev);
+
+    switch (cmd) {
+    case VFIO_DEVICE_GET_INFO: {
+        struct vfio_device_info info;
+
+        if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
+            return -EFAULT;
+
+        info.flags = VFIO_DEVICE_FLAGS_PCI | VFIO_DEVICE_FLAGS_RESET;
+        info.num_regions = VFIO_PCI_NUM_REGIONS;
+        info.num_irqs    = VFIO_PCI_NUM_IRQS;
+
+        if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+            return -EFAULT;
+        return 0;
+    }
+
+    case VFIO_DEVICE_GET_REGION_INFO: {
+        struct vfio_region_info reg_info;
+
+        if (copy_from_user(&reg_info, (void __user *)arg, sizeof(reg_info)))
+            return -EFAULT;
+
+        memset(&reg_info, 0, sizeof(reg_info));
+        reg_info.argsz = sizeof(reg_info);
+
+        switch (reg_info.index) {
+        case VFIO_PCI_BAR0_REGION_INDEX:
+            /* BAR0: MMIO registers — trapped and emulated */
+            reg_info.flags = VFIO_REGION_INFO_FLAG_READ |
+                             VFIO_REGION_INFO_FLAG_WRITE;
+            reg_info.size  = g_tempo->bar0_size;
+            break;
+        case VFIO_PCI_BAR1_REGION_INDEX:
+            /* BAR1: VRAM aperture — mapped to VM's partition */
+            reg_info.flags = VFIO_REGION_INFO_FLAG_READ |
+                             VFIO_REGION_INFO_FLAG_WRITE |
+                             VFIO_REGION_INFO_FLAG_MMAP;
+            reg_info.size  = vm->vram_size;
+            break;
+        default:
+            reg_info.size = 0;
+            break;
+        }
+
+        if (copy_to_user((void __user *)arg, &reg_info, sizeof(reg_info)))
+            return -EFAULT;
+        return 0;
+    }
+
+    case VFIO_DEVICE_GET_IRQ_INFO: {
+        struct vfio_irq_info irq_info;
+
+        if (copy_from_user(&irq_info, (void __user *)arg, sizeof(irq_info)))
+            return -EFAULT;
+
+        memset(&irq_info, 0, sizeof(irq_info));
+        irq_info.argsz = sizeof(irq_info);
+
+        if (irq_info.index == VFIO_PCI_MSI_IRQ_INDEX) {
+            irq_info.flags = VFIO_IRQ_INFO_EVENTFD;
+            irq_info.count = 1;
+        }
+
+        if (copy_to_user((void __user *)arg, &irq_info, sizeof(irq_info)))
+            return -EFAULT;
+        return 0;
+    }
+
+    case VFIO_DEVICE_RESET:
+        pr_info(TEMPO_DRIVER_NAME ": VM %d reset\n", vm->vm_id);
+        vm->state = VM_STATE_IDLE;
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
+static ssize_t tempo_vfio_read(struct vfio_device *vdev, char __user *buf,
+                               size_t count, loff_t *ppos)
+{
+    struct tempo_vm *vm = container_of(vdev, struct tempo_vm, vfio_dev);
+
+    return tempo_mmio_read(g_tempo, vm, buf, count, ppos);
+}
+
+static ssize_t tempo_vfio_write(struct vfio_device *vdev,
+                                const char __user *buf,
+                                size_t count, loff_t *ppos)
+{
+    struct tempo_vm *vm = container_of(vdev, struct tempo_vm, vfio_dev);
+
+    return tempo_mmio_write(g_tempo, vm, buf, count, ppos);
+}
+
+static const struct vfio_device_ops tempo_vfio_ops = {
+    .name           = TEMPO_DRIVER_NAME,
+    .open_device    = tempo_vfio_open_device,
+    .close_device   = tempo_vfio_close_device,
+    .ioctl          = tempo_vfio_ioctl,
+    .read           = tempo_vfio_read,
+    .write          = tempo_vfio_write,
+};
+
+/* ──────────────────────────────────────────────────────────────────
+ * MDEV Lifecycle: probe / remove
+ *
+ * Called when a mediated device is created / destroyed via sysfs:
+ *   echo <UUID> > .../mdev_supported_types/tempo-1g/create
+ *   echo 1 > /sys/bus/mdev/devices/<UUID>/remove
+ * ────────────────────────────────────────────────────────────────── */
+
+static int tempo_mdev_probe(struct mdev_device *mdev)
+{
+    struct tempo_vm *vm;
+    int vm_id, tsg_id, ret;
+    unsigned long flags;
+
+    /* 1. Allocate the VM struct using the VFIO managed allocator */
+    /* This handles the internal initialization of vm->vfio_dev */
+    vm = vfio_alloc_device(tempo_vm, vfio_dev, &mdev->dev, &tempo_vfio_ops);
+    if (IS_ERR(vm)) {
+        return PTR_ERR(vm);
+    }
+
+    /* 2. Lock-protected ID assignment */
+    spin_lock_irqsave(&g_tempo->sched_lock, flags);
+    if (g_tempo->num_vms >= TEMPO_MAX_VMS) {
+        spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+        pr_err(TEMPO_DRIVER_NAME ": max VMs reached (%d)\n", TEMPO_MAX_VMS);
+        ret = -ENOSPC;
+        goto err_put;
+    }
+    vm_id = g_tempo->num_vms++;
+    spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+
+    /* 3. Initialize custom fields */
+    vm->vm_id    = vm_id;
+    vm->active   = true;
+    vm->state    = VM_STATE_IDLE;
+    vm->priority = PRIO_STANDARD;
+    guid_copy(&vm->uuid, &mdev->uuid);
+
+    /* 4. Resource Allocation (TSG and VRAM) */
+    tsg_id = tempo_tsg_alloc(g_tempo, vm_id);
+    if (tsg_id < 0) {
+        pr_err(TEMPO_DRIVER_NAME ": failed to allocate TSG for VM %d\n", vm_id);
+        ret = tsg_id;
+        goto err_dec_vms;
+    }
+    vm->tsg_id = tsg_id;
+    tempo_vram_alloc_partition(g_tempo, vm);
+
+    /* 5. Register with VFIO core */
+    ret = vfio_register_group_dev(&vm->vfio_dev);
+    if (ret) {
+        pr_err(TEMPO_DRIVER_NAME ": vfio_register_group_dev failed: %d\n", ret);
+        goto err_free_resources;
+    }
+
+    dev_set_drvdata(&mdev->dev, vm);
+
+    /* Store the pointer in your global tracking if necessary,
+       but remember VFIO now owns the primary lifecycle */
+    g_tempo->vms[vm_id] = vm;
+
+    pr_info(TEMPO_DRIVER_NAME ": created VM %d (TSG %u, VRAM %llu MB)\n",
+            vm_id, vm->tsg_id, vm->vram_size >> 20);
+
+    return 0;
+
+err_free_resources:
+    /* Add calls here to free TSG and VRAM if registration fails */
+err_dec_vms:
+    spin_lock_irqsave(&g_tempo->sched_lock, flags);
+    g_tempo->num_vms--;
+    spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+err_put:
+    /* This triggers the .release callback in your ops and calls kfree(vm) */
+    vfio_put_device(&vm->vfio_dev);
+    return ret;
+}
+// static int tempo_mdev_probe(struct mdev_device *mdev)
+// {
+//     struct tempo_vm *vm;
+//     int vm_id, tsg_id;
+//     unsigned long flags;
+//
+//     spin_lock_irqsave(&g_tempo->sched_lock, flags);
+//     if (g_tempo->num_vms >= TEMPO_MAX_VMS) {
+//         spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+//         pr_err(TEMPO_DRIVER_NAME ": max VMs reached (%d)\n", TEMPO_MAX_VMS);
+//         return -ENOSPC;
+//     }
+//     vm_id = g_tempo->num_vms++;
+//     spin_unlock_irqrestore(&g_tempo->sched_lock, flags);
+//
+//     vm = &g_tempo->vms[vm_id];
+//     memset(vm, 0, sizeof(*vm));
+//     vm->vm_id   = vm_id;
+//     vm->active  = true;
+//     vm->state   = VM_STATE_IDLE;
+//     vm->priority = PRIO_STANDARD;
+//     // guid_copy(&vm->uuid, mdev_uuid(mdev));
+//     guid_copy(&vm->uuid, &mdev->uuid);
+//
+//     /* Allocate a TSG for this VM */
+//     tsg_id = tempo_tsg_alloc(g_tempo, vm_id);
+//     if (tsg_id < 0) {
+//         pr_err(TEMPO_DRIVER_NAME ": failed to allocate TSG for VM %d\n", vm_id);
+//         g_tempo->num_vms--;
+//         return tsg_id;
+//     }
+//     vm->tsg_id = tsg_id;
+//
+//     /* Allocate VRAM partition */
+//     tempo_vram_alloc_partition(g_tempo, vm);
+//
+//     /* Register VFIO device */
+//     // vfio_init_group_dev(&vm->vfio_dev, &mdev->dev, &tempo_vfio_ops);
+//
+//     vfio_device_init(&vm->vfio_dev, &mdev->dev, &tempo_vfio_ops);
+//     int ret;
+//     ret = vfio_register_group_dev(&vm->vfio_dev);
+//     if (ret){
+//         vfio_put_device(&vm->vfio_dev);
+//         pr_info("vfio_register_group dev failed with ret: %d\n", ret);
+//         return ret;
+//     }
+//     dev_set_drvdata(&mdev->dev, vm);
+//
+//     pr_info(TEMPO_DRIVER_NAME ": created VM %d (TSG %u, VRAM %llu MB)\n",
+//             vm_id, vm->tsg_id, vm->vram_size >> 20);
+//     return 0;
+// }
+
+static void tempo_mdev_remove(struct mdev_device *mdev)
+{
+    struct tempo_vm *vm = dev_get_drvdata(&mdev->dev);
+
+    if (!vm)
+        return;
+
+    /* Deschedule if active */
+    if (g_tempo->active_vm_id == vm->vm_id) {
+        g_tempo->active_vm_id = -1;
+        tempo_runlist_build_and_submit_empty(g_tempo);
+    }
+
+    /* Release resources */
+    tempo_tsg_free(g_tempo, vm->tsg_id);
+    tempo_vram_free_partition(g_tempo, vm);
+
+    vm->active = false;
+    vm->state  = VM_STATE_IDLE;
+
+    pr_info(TEMPO_DRIVER_NAME ": removed VM %d\n", vm->vm_id);
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * MDEV Driver and Parent registration
+ * ────────────────────────────────────────────────────────────────── */
+
+static struct mdev_driver tempo_mdev_driver = {
+    .driver = {
+        .name   = TEMPO_DRIVER_NAME,
+        .owner  = THIS_MODULE,
+    },
+    .probe  = tempo_mdev_probe,
+    .remove = tempo_mdev_remove,
+};
+
+static struct mdev_parent tempo_mdev_parent;
+
+/* ──────────────────────────────────────────────────────────────────
+ * PCI / BAR0 Setup
+ * ────────────────────────────────────────────────────────────────── */
+
+static int tempo_map_bars(struct tempo_gpu_state *g)
+{
+    g->bar0_size = pci_resource_len(g->pdev, 0);
+    if (!g->bar0_size) {
+        pr_err(TEMPO_DRIVER_NAME ": BAR0 has zero length\n");
+        return -ENODEV;
+    }
+
+    g->bar0 = pci_iomap(g->pdev, 0, 0);
+    if (!g->bar0) {
+        pr_err(TEMPO_DRIVER_NAME ": failed to map BAR0\n");
+        return -ENOMEM;
+    }
+
+    /* Read chip identification */
+    g->boot0   = tempo_rd32(g, NV_PMC_BOOT_0);
+    g->chip_id = (g->boot0 >> 20) & 0x1FF;
+
+    pr_info(TEMPO_DRIVER_NAME ": BAR0 mapped at %p (size %llu KB)\n",
+            g->bar0, (u64)g->bar0_size >> 10);
+    pr_info(TEMPO_DRIVER_NAME ": GPU BOOT0=0x%08x chip_id=0x%03x\n",
+            g->boot0, g->chip_id);
+
+    return 0;
+}
+
+static void tempo_unmap_bars(struct tempo_gpu_state *g)
+{
+    if (g->bar0) {
+        pci_iounmap(g->pdev, g->bar0);
+        g->bar0 = NULL;
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * Module Init / Exit
+ * ────────────────────────────────────────────────────────────────── */
+
+static int __init tempo_gpu_init(void)
+{
+    struct pci_dev *pdev = NULL;
+    int ret;
+
+    pr_info(TEMPO_DRIVER_NAME ": Tempo GPU Temporal Scheduler loading...\n");
+
+    /* Find the first NVIDIA GPU (vendor 0x10DE) */
+    pdev = pci_get_device(0x10DE, PCI_ANY_ID, NULL);
+    while (pdev) {
+        /* Accept only 3D controllers (class 0x0302) or VGA (0x0300) */
+        if ((pdev->class >> 8) == 0x0302 || (pdev->class >> 8) == 0x0300)
+            break;
+        pdev = pci_get_device(0x10DE, PCI_ANY_ID, pdev);
+    }
+    if (!pdev) {
+        pr_err(TEMPO_DRIVER_NAME ": no NVIDIA GPU found\n");
+        return -ENODEV;
+    }
+
+    /* Allocate global state */
+    g_tempo = kzalloc(sizeof(*g_tempo), GFP_KERNEL);
+    if (!g_tempo) {
+        pci_dev_put(pdev);
+        return -ENOMEM;
+    }
+
+    g_tempo->pdev = pdev;
+    g_tempo->active_vm_id = -1;
+    spin_lock_init(&g_tempo->sched_lock);
+    INIT_WORK(&g_tempo->sched_work, NULL);  /* Set in sched_init */
+
+    /* Map GPU MMIO registers */
+    ret = tempo_map_bars(g_tempo);
+    if (ret)
+        goto fail_free;
+
+    /* Initialize subsystems */
+    ret = tempo_tsg_init(g_tempo);
+    if (ret)
+        goto fail_unmap;
+
+    ret = tempo_runlist_init(g_tempo);
+    if (ret)
+        goto fail_tsg;
+
+    ret = tempo_vram_init(g_tempo);
+    if (ret)
+        goto fail_runlist;
+
+    tempo_idle_init(g_tempo);
+    tempo_sched_init(g_tempo);
+
+    /* Register mdev parent on the GPU PCI device */
+    // ret = mdev_register_parent(&tempo_mdev_parent, &pdev->dev,
+    //                            &tempo_mdev_driver,
+    //                            tempo_mdev_type_groups);
+    //
+    ret = mdev_register_parent(&tempo_mdev_parent,
+                               &pdev->dev,
+                               &tempo_mdev_driver,
+                               tempo_mdev_types,
+                               ARRAY_SIZE(tempo_mdev_types));
+    if (ret) {
+        pr_err(TEMPO_DRIVER_NAME ": mdev_register_parent failed: %d\n", ret);
+        goto fail_sched;
+    }
+
+    /* Debugfs */
+    tempo_debugfs_init(g_tempo);
+
+    pr_info(TEMPO_DRIVER_NAME ": initialized on %s (chip 0x%03x)\n",
+            pci_name(pdev), g_tempo->chip_id);
+    return 0;
+
+fail_sched:
+    tempo_sched_exit(g_tempo);
+    tempo_idle_exit(g_tempo);
+    tempo_vram_exit(g_tempo);
+fail_runlist:
+    tempo_runlist_exit(g_tempo);
+fail_tsg:
+    tempo_tsg_exit(g_tempo);
+fail_unmap:
+    tempo_unmap_bars(g_tempo);
+fail_free:
+    pci_dev_put(pdev);
+    kfree(g_tempo);
+    g_tempo = NULL;
+    return ret;
+}
+
+static void __exit tempo_gpu_exit(void)
+{
+    if (!g_tempo)
+        return;
+
+    tempo_debugfs_exit(g_tempo);
+    mdev_unregister_parent(&tempo_mdev_parent);
+    tempo_sched_exit(g_tempo);
+    tempo_idle_exit(g_tempo);
+    tempo_vram_exit(g_tempo);
+    tempo_runlist_exit(g_tempo);
+    tempo_tsg_exit(g_tempo);
+    tempo_unmap_bars(g_tempo);
+
+    pci_dev_put(g_tempo->pdev);
+    kfree(g_tempo);
+    g_tempo = NULL;
+
+    pr_info(TEMPO_DRIVER_NAME ": unloaded\n");
+}
+
+module_init(tempo_gpu_init);
+module_exit(tempo_gpu_exit);
+
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("Tempo GPU Project");
+MODULE_DESCRIPTION("Tempo GPU: Workload-Aware Temporal GPU Scheduler for VMs");
+MODULE_VERSION("0.1");
